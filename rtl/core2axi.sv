@@ -100,11 +100,17 @@ module core2axi
   );
 
 
-  enum logic [2:0] { IDLE, READ_WAIT, WRITE_DATA, WRITE_ADDR, WRITE_WAIT } CS, NS;
+  enum logic [2:0] { IDLE, READ_ADDR, READ_WAIT, WRITE_ADDR_DATA, WRITE_DATA, WRITE_ADDR, WRITE_WAIT } CS, NS;
 
   logic [31:0]  rdata;
   logic         valid;
   logic         granted;
+
+  logic [AXI4_ADDRESS_WIDTH-1:0] data_addr_q;
+  logic [3:0]                    data_be_q;
+  logic [3:0]                    data_be_int;
+  logic [31:0]                   data_wdata_q;
+  logic [31:0]                   data_wdata_int;
 
   // main FSM
   always_comb
@@ -119,6 +125,11 @@ module core2axi
     w_valid_o  = 1'b0;
     b_ready_o  = 1'b0;
 
+    aw_addr_o      = data_addr_i;
+    ar_addr_o      = data_addr_i;
+    data_wdata_int = data_wdata_i;
+    data_be_int    = data_be_i;
+
     case (CS)
       // wait for a request to come in from the core
       IDLE: begin
@@ -126,6 +137,8 @@ module core2axi
         // change it here, take care to change it there too!
         if (data_req_i)
         begin
+          granted = 1'b1;
+
           // send address over aw channel for writes,
           // over ar channels for reads
           if (data_we_i)
@@ -135,7 +148,6 @@ module core2axi
 
             if (aw_ready_i) begin
               if (w_ready_i) begin
-                granted = 1'b1;
                 NS = WRITE_WAIT;
               end else begin
                 NS = WRITE_DATA;
@@ -144,17 +156,16 @@ module core2axi
               if (w_ready_i) begin
                 NS = WRITE_ADDR;
               end else begin
-                NS = IDLE;
+                NS = WRITE_ADDR_DATA;
               end
             end
           end else begin
             ar_valid_o = 1'b1;
 
             if (ar_ready_i) begin
-              granted = 1'b1;
               NS = READ_WAIT;
             end else begin
-              NS = IDLE;
+              NS = READ_ADDR;
             end
           end
         end else begin
@@ -162,12 +173,40 @@ module core2axi
         end
       end
 
+      // the bus has neither accepted the address nor the data. So we wait and react on what ever
+      // comes first
+      WRITE_ADDR_DATA: begin
+        w_valid_o  = 1'b1;
+        aw_valid_o = 1'b1;
+
+        // keep address and data information stable
+        aw_addr_o      = data_addr_q;
+        data_wdata_int = data_wdata_q;
+        data_be_int    = data_be_q;
+
+        if (aw_ready_i) begin
+          if (w_ready_i) begin
+            NS = WRITE_WAIT;
+          end else begin
+            NS = WRITE_DATA;
+          end
+        end else begin
+          if (w_ready_i) begin
+            NS = WRITE_ADDR;
+          end
+        end
+      end
+
       // if the bus has not accepted our write data right away, but has
       // accepted the address already
       WRITE_DATA: begin
         w_valid_o = 1'b1;
+
+        // keep data information stable
+        data_wdata_int = data_wdata_q;
+        data_be_int    = data_be_q;
+
         if (w_ready_i) begin
-          granted = 1'b1;
           NS = WRITE_WAIT;
         end
       end
@@ -178,8 +217,10 @@ module core2axi
       WRITE_ADDR: begin
         aw_valid_o = 1'b1;
 
+        // keep address information stable
+        aw_addr_o = data_addr_q;
+
         if (aw_ready_i) begin
-          granted = 1'b1;
           NS = WRITE_WAIT;
         end
       end
@@ -196,6 +237,18 @@ module core2axi
 
           NS = IDLE;
         end
+      end
+
+      // we wait for the read address channel to be ready and keep the latched address stable
+      READ_ADDR:
+      begin
+        ar_valid_o = 1'b1;
+
+        // keep address information stable
+        ar_addr_o = data_addr_q;
+
+        if (ar_ready_i)
+          NS = READ_WAIT;
       end
 
       // we wait for the read response, address has been sent successfully
@@ -223,10 +276,21 @@ module core2axi
     if (~rst_ni)
     begin
       CS     <= IDLE;
+      data_addr_q  = ~0;
+      data_wdata_q = ~0;
+      data_be_q    = ~0;
     end
     else
     begin
       CS     <= NS;
+
+      case (CS)
+          WRITE_WAIT, READ_WAIT, IDLE: begin
+              data_addr_q  <= data_addr_i;
+              data_wdata_q <= data_wdata_i;
+              data_be_q    <= data_be_i;
+          end
+      endcase;
     end
   end
 
@@ -257,15 +321,15 @@ module core2axi
   generate
     genvar w;
     for(w = 0; w < AXI4_WDATA_WIDTH/32; w++) begin
-      assign w_data_o[w*32 + 31:w*32 + 0] = data_wdata_i; // just replicate the wdata to fill the bus
+      assign w_data_o[w*32 + 31:w*32 + 0] = data_wdata_int; // just replicate the wdata to fill the bus
     end
   endgenerate
 
   // take care of write strobe
   generate if (AXI4_WDATA_WIDTH == 32) begin
-      assign w_strb_o = data_be_i;
+      assign w_strb_o = data_be_int;
     end else if (AXI4_WDATA_WIDTH == 64) begin
-      assign w_strb_o = data_addr_i[2] ? {data_be_i, 4'b0000} : {4'b0000, data_be_i};
+      assign w_strb_o = data_addr_i[2] ? {data_be_int, 4'b0000} : {4'b0000, data_be_int};
     end else begin
       `ifndef SYNTHESIS
       initial $error("AXI4_WDATA_WIDTH has an invalid value");
@@ -275,7 +339,6 @@ module core2axi
 
   // AXI interface assignments
   assign aw_id_o     = '0;
-  assign aw_addr_o   = data_addr_i;
   assign aw_size_o   = 3'b010;
   assign aw_len_o    = '0;
   assign aw_burst_o  = '0;
@@ -287,7 +350,6 @@ module core2axi
   assign aw_qos_o    = '0;
 
   assign ar_id_o     = '0;
-  assign ar_addr_o   = data_addr_i;
   assign ar_size_o   = 3'b010;
   assign ar_len_o    = '0;
   assign ar_burst_o  = '0;
